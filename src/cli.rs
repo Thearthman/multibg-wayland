@@ -72,9 +72,9 @@ pub struct Cli {
    #[arg(long)]
    pub list_outputs: bool,
     /// Slideshow duration in seconds: cycle images in slideshow workspace
-    /// folders with this interval. Disabled by default.
-    #[arg(long)]
-    pub slideshow_duration: Option<u64>,
+    /// folders with this interval.
+    #[arg(long, default_value_t = 300)]
+    pub slideshow_duration: u64,
    /// directory with: wallpaper_dir/output/workspace_name.{jpg|png|...}
     #[arg(default_value = ".")]
     pub wallpaper_dir: String,

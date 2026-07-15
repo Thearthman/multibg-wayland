@@ -70,7 +70,7 @@ struct State {
     dmabuf_state: DmabufState,
     gpu: Option<Gpu>,
     show_serials: bool,
-    slideshow_duration: Option<Duration>,
+    slideshow_duration: Duration,
 }
 
 impl State {
@@ -122,7 +122,7 @@ fn run() -> anyhow::Result<()> {
     let wallpaper_dir = Path::new(&cli.wallpaper_dir).canonicalize().unwrap();
     let color_transform = cli.levels()?.map(ColorTransform::from_levels);
 
-    let slideshow_duration = cli.slideshow_duration.map(Duration::from_secs);
+    let slideshow_duration = Duration::from_secs(cli.slideshow_duration.into());
 
     // ********************************
     //     Initialize wayland client
@@ -176,14 +176,12 @@ fn run() -> anyhow::Result<()> {
     let waker = Arc::new(Waker::new().unwrap());
 
     // Create timerfd for slideshow if enabled
-    let timerfd = if slideshow_duration.is_some() {
+    let timerfd = {
         let fd = timerfd_create(
             TimerfdClockId::Monotonic,
             TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK,
         ).map_err(|e| error!("Failed to create timerfd: {e}")).ok();
         fd
-    } else {
-        None
     };
 
     let mut state = State {
@@ -224,11 +222,9 @@ fn run() -> anyhow::Result<()> {
     let token_signal = signal_pipe.as_ref().map(|pipe| poll.add_readable(pipe));
     let token_timer = timerfd.as_ref().map(|fd| poll.add_readable(fd));
 
-    // Start the initial slideshow timer if enabled
-    if let Some(duration) = state.slideshow_duration {
-        if let Some(ref timerfd) = timerfd {
-            reset_timerfd(timerfd, duration);
-        }
+    // Start the initial slideshow timer
+    if let Some(ref timerfd) = timerfd {
+        reset_timerfd(timerfd, state.slideshow_duration);
     }
 
     loop {
@@ -389,11 +385,9 @@ fn handle_slideshow_tick(
     }
 
     // Reset the timer for the next tick
-    if let Some(duration) = state.slideshow_duration {
-        if let Some(ref timerfd) = timerfd {
-            if any_advanced {
-                reset_timerfd(timerfd, duration);
-            }
+    if let Some(ref timerfd) = timerfd {
+        if any_advanced {
+            reset_timerfd(timerfd, state.slideshow_duration);
         }
     }
 }
