@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use log::{debug, error, warn};
+use rand::seq::SliceRandom;
 use rustix::fs::{Dev, major, minor};
 use smithay_client_toolkit::{
     delegate_compositor, delegate_dmabuf, delegate_layer, delegate_output,
@@ -54,7 +55,7 @@ use crate::{
         DRM_FORMAT_XRGB8888, fmt_modifier,
         GpuMemory, GpuUploader, GpuWallpaper,
     },
-    image::{load_wallpaper, output_wallpaper_files, WallpaperFile},
+    image::{load_wallpaper, output_wallpaper_files, ColorTransform, WallpaperEntry, WallpaperFile},
 };
 
 const MAX_FDS_OUT: usize = 28;
@@ -62,8 +63,8 @@ const MAX_FDS_OUT: usize = 28;
 pub struct BackgroundLayer {
     pub output_name: String,
     output_make_model_serial: String,
-    width: i32,
-    height: i32,
+    pub width: i32,
+    pub height: i32,
     layer: LayerSurface,
     configured: bool,
     workspace_backgrounds: Vec<WorkspaceBackground>,
@@ -97,14 +98,27 @@ impl BackgroundLayer {
             return
         }
 
-        let Some(workspace_bg) = self.workspace_backgrounds.iter()
-            .find(|bg| bg.workspace_name == workspace_name)
+        // Deactivate any previously active slideshow on this output
+        for bg in self.workspace_backgrounds.iter_mut() {
+            if let Some(ref mut slideshow) = bg.slideshow {
+                if slideshow.is_active {
+                    debug!("Deactivating slideshow for workspace {} on output {}",
+                        bg.workspace_name, self.output_name);
+                    slideshow.is_active = false;
+                }
+            }
+        }
+
+        let workspace_index = self.workspace_backgrounds.iter()
+            .position(|bg| bg.workspace_name == workspace_name)
             .or_else(|| self.workspace_backgrounds.iter()
-                .find(|bg| bg.workspace_number == workspace_number)
+                .position(|bg| bg.workspace_number == workspace_number)
             )
             .or_else(|| self.workspace_backgrounds.iter()
-                .find(|bg| bg.workspace_name == "_default")
-            )
+                .position(|bg| bg.workspace_name == "_default")
+            );
+
+        let Some(workspace_index) = workspace_index
         else {
             error!(
                 "There is no wallpaper image on output {} for workspace {}, \
@@ -117,7 +131,19 @@ impl BackgroundLayer {
             );
             return
         };
-        let wallpaper = &workspace_bg.wallpaper;
+
+        // Get the wallpaper (activate slideshow if present)
+        let wallpaper_rc = {
+            let bg = &mut self.workspace_backgrounds[workspace_index];
+            if let Some(ref mut slideshow) = bg.slideshow {
+                slideshow.is_active = true;
+                debug!("Activating slideshow for workspace {} on output {} at index {}/{}",
+                    bg.workspace_name, self.output_name,
+                    slideshow.current_index, slideshow.permutation.len());
+            }
+            Rc::clone(&bg.wallpaper)
+        };
+        let wallpaper = &wallpaper_rc;
 
         if let Some(current) = &self.current_wallpaper {
             if Rc::ptr_eq(current, wallpaper) {
@@ -151,12 +177,125 @@ impl BackgroundLayer {
         debug!("Setting wallpaper on output {} for workspace: {}",
             self.output_name, workspace_name);
     }
+
+    /// Advance the active slideshow to the next image.
+    /// Loads the next image lazily from disk, swaps it in, and drops the old
+    /// wallpaper. At most 2 images are in memory during the brief swap window.
+    /// Returns true if advanced.
+    pub fn advance_slideshow(
+        &mut self,
+        shm: &Shm,
+        qh: &QueueHandle<State>,
+        shm_format: wl_shm::Format,
+        shm_stride: usize,
+        shm_size: usize,
+        color_transform: Option<ColorTransform>,
+        resizer: &mut fast_image_resize::Resizer,
+    ) -> bool {
+        // Find the active slideshow workspace
+        let Some(active_index) = self.workspace_backgrounds.iter()
+            .position(|bg| bg.slideshow.as_ref().map_or(false, |s| s.is_active))
+        else {
+            return false
+        };
+
+        // Calculate the next index
+        let (next_path, next_index, next_permutation) = {
+            let bg = &mut self.workspace_backgrounds[active_index];
+            let slideshow = bg.slideshow.as_mut().unwrap();
+
+            let next_index = {
+                let n = slideshow.current_index + 1;
+                if n >= slideshow.permutation.len() { 0 } else { n }
+            };
+            let is_wrapping = next_index == 0;
+
+            let (next_path, next_permutation) = if is_wrapping {
+                let mut new_perm = slideshow.permutation.clone();
+                new_perm.shuffle(&mut rand::thread_rng());
+                let path = slideshow.image_paths[new_perm[0]].clone();
+                (path, Some(new_perm))
+            } else {
+                let path = slideshow.image_paths[slideshow.permutation[next_index]].clone();
+                (path, None)
+            };
+
+            (next_path, next_index, next_permutation)
+        };
+
+        // Load the next image from disk (synchronous, blocks briefly)
+        let new_wallpaper = match load_slideshow_image(
+            &next_path,
+            shm, qh, shm_format, shm_stride, shm_size,
+            color_transform, resizer,
+            self.width as u32, self.height as u32,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to load slideshow image {:?}: {e:#}", next_path);
+                // Skip this image: advance index so we don't retry the broken file
+                let bg = &mut self.workspace_backgrounds[active_index];
+                let slideshow = bg.slideshow.as_mut().unwrap();
+                slideshow.current_index = next_index;
+                if let Some(new_perm) = next_permutation {
+                    slideshow.permutation = new_perm;
+                }
+                return true
+            }
+        };
+
+        // Commit state changes and swap
+        {
+            let bg = &mut self.workspace_backgrounds[active_index];
+            let slideshow = bg.slideshow.as_mut().unwrap();
+
+            slideshow.current_index = next_index;
+            if let Some(new_perm) = next_permutation {
+                slideshow.permutation = new_perm;
+                debug!("Slideshow for workspace {} on output {} completed a cycle, re-shuffled",
+                    bg.workspace_name, self.output_name);
+            }
+
+            // Replace wallpaper (old Rc dropped, freeing its shm pool)
+            bg.wallpaper = new_wallpaper;
+
+            debug!("Advanced slideshow on output {} for workspace: {} to index {}/{}",
+                self.output_name, bg.workspace_name,
+                slideshow.current_index, slideshow.permutation.len());
+        }
+
+        // Attach the new wallpaper to the layer
+        let wallpaper = {
+            let bg = &self.workspace_backgrounds[active_index];
+            Rc::clone(&bg.wallpaper)
+        };
+        {
+            let wallpaper_borrow = wallpaper.borrow();
+            if let Some(wl_buffer) = wallpaper_borrow.wl_buffer.as_ref() {
+                self.layer.attach(Some(wl_buffer), 0, 0);
+                self.layer.wl_surface().damage_buffer(0, 0, self.width, self.height);
+                self.layer.commit();
+            }
+        }
+        self.current_wallpaper = Some(wallpaper);
+        self.queued_wallpaper = None;
+
+        true
+    }
 }
 
 struct WorkspaceBackground {
     workspace_name: String,
     workspace_number: i32,
     wallpaper: Rc<RefCell<Wallpaper>>,
+    slideshow: Option<SlideshowState>,
+}
+
+pub struct SlideshowState {
+    image_paths: Vec<PathBuf>,
+    permutation: Vec<usize>,
+    current_index: usize,
+    is_active: bool,
 }
 
 struct Wallpaper {
@@ -307,7 +446,8 @@ impl DmabufHandler for State {
     ) {
         for bg_layer in self.background_layers.iter_mut() {
             for workspace_bg in bg_layer.workspace_backgrounds.iter_mut() {
-                let wallpaper = &workspace_bg.wallpaper;
+                // Slideshows keep only the current image in bg.wallpaper
+                let wallpaper = Rc::clone(&workspace_bg.wallpaper);
                 let mut wallpaper_borrow = wallpaper.borrow_mut();
                 if wallpaper_borrow.memory.dmabuf_params_destroy_eq(params) {
                     wallpaper_borrow.wl_buffer = Some(buffer);
@@ -316,7 +456,7 @@ impl DmabufHandler for State {
                     drop(wallpaper_borrow);
                     if let Some(queued_weak) = &bg_layer.queued_wallpaper {
                         if let Some(queued) = queued_weak.upgrade() {
-                            if Rc::ptr_eq(&queued, wallpaper) {
+                            if Rc::ptr_eq(&queued, &wallpaper) {
                                 let name = workspace_bg.workspace_name.clone();
                                 let number = workspace_bg.workspace_number;
                                 bg_layer.draw_workspace_bg(&name, number);
@@ -340,8 +480,14 @@ impl DmabufHandler for State {
         let mut failed_bg_layer_indecies = Vec::new();
         for (i, bg_layer) in self.background_layers.iter_mut().enumerate() {
             for workspace_bg in bg_layer.workspace_backgrounds.iter_mut() {
-                let mut wallpaper = workspace_bg.wallpaper.borrow_mut();
-                if wallpaper.memory.dmabuf_params_destroy_eq(params) {
+                // Slideshows only have the current image in bg.wallpaper
+                let mut found = false;
+                let wallpaper = Rc::clone(&workspace_bg.wallpaper);
+                let mut wallpaper_borrow = wallpaper.borrow_mut();
+                if wallpaper_borrow.memory.dmabuf_params_destroy_eq(params) {
+                    found = true;
+                }
+                if found {
                     error!("Falling back to shm and reloading wallpapers \
                         for output {}", bg_layer.output_name);
                     failed_bg_layer_indecies.push(i);
@@ -867,10 +1013,51 @@ fn layer_surface_name(output_name: &str) -> Option<String> {
     Some([env!("CARGO_PKG_NAME"), "_wallpaper_", output_name].concat())
 }
 
+fn load_slideshow_image(
+    path: &PathBuf,
+    shm: &Shm,
+    qh: &QueueHandle<State>,
+    shm_format: wl_shm::Format,
+    shm_stride: usize,
+    shm_size: usize,
+    color_transform: Option<ColorTransform>,
+    resizer: &mut fast_image_resize::Resizer,
+    surface_width: u32,
+    surface_height: u32,
+) -> anyhow::Result<Rc<RefCell<Wallpaper>>> {
+    let mut shm_pool = RawPool::new(shm_size, shm)
+        .context("Failed to create shm pool for slideshow image")?;
+    load_wallpaper(
+        path,
+        shm_pool.mmap(),
+        surface_width,
+        surface_height,
+        shm_stride,
+        shm_format,
+        color_transform,
+        resizer,
+    ).context("Failed to load slideshow image")?;
+    let wl_buffer = shm_pool.create_buffer(
+        0,
+        surface_width as i32,
+        surface_height as i32,
+        shm_stride.try_into().unwrap(),
+        shm_format,
+        (),
+        qh,
+    );
+    Ok(Rc::new(RefCell::new(Wallpaper {
+        wl_buffer: Some(wl_buffer),
+        memory: Memory::WlShm { pool: shm_pool },
+        canon_path: path.clone(),
+        canon_modified: 0,  // Lazy-loaded images don't track modification time
+    })))
+}
+
 fn find_equal_wallpaper(
     background_layers: &[BackgroundLayer],
-    width: i32,
-    height: i32,
+        width: i32,
+        height: i32,
     transform: Transform,
     wallpaper_file: &WallpaperFile,
     gpu_uploader: Option<&GpuUploader>,
@@ -881,14 +1068,20 @@ fn find_equal_wallpaper(
             && bg_layer.transform == transform
         {
             for bg in &bg_layer.workspace_backgrounds {
-                let wallpaper = bg.wallpaper.borrow();
+                // Slideshows have only the current image in memory;
+                // skip dedup for slideshow entries (they load lazily)
+                if bg.slideshow.is_some() {
+                    continue
+                }
+                let wallpaper_rc = &bg.wallpaper;
+                let wallpaper = wallpaper_rc.borrow();
                 if wallpaper.canon_modified == wallpaper_file.canon_modified
                     && wallpaper.canon_path == wallpaper_file.canon_path
                     && wallpaper.memory.gpu_uploader_eq(gpu_uploader)
                 {
                     debug!("Reusing the wallpaper of output {} workspace {}",
                         bg_layer.output_name, bg.workspace_name);
-                    return Some(Rc::clone(&bg.wallpaper));
+                    return Some(Rc::clone(wallpaper_rc));
                 }
             }
         }
@@ -902,14 +1095,19 @@ fn find_equal_output_wallpaper(
     gpu_uploader: Option<&GpuUploader>,
 ) -> Option<Rc<RefCell<Wallpaper>>> {
     for bg in workspace_backgrounds {
-        let wallpaper = bg.wallpaper.borrow();
+        // Slideshows have only the current image in memory; skip dedup
+        if bg.slideshow.is_some() {
+            continue
+        }
+        let wallpaper_rc = &bg.wallpaper;
+        let wallpaper = wallpaper_rc.borrow();
         if wallpaper.canon_modified == wallpaper_file.canon_modified
             && wallpaper.canon_path == wallpaper_file.canon_path
             && wallpaper.memory.gpu_uploader_eq(gpu_uploader)
         {
             debug!("Reusing the wallpaper of workspace {}",
                 bg.workspace_name);
-            return Some(Rc::clone(&bg.wallpaper));
+            return Some(Rc::clone(wallpaper_rc));
         }
     }
     None
@@ -923,8 +1121,10 @@ fn print_memory_stats(background_layers: &[BackgroundLayer]) {
         let mut dmabuf_size = 0.0f32;
         for bg_layer in background_layers {
             for bg in &bg_layer.workspace_backgrounds {
-                let factor = 1.0 / Rc::strong_count(&bg.wallpaper) as f32;
-                match &bg.wallpaper.borrow().memory {
+                // Slideshows keep only the current image in memory
+                let wallpaper_rc = &bg.wallpaper;
+                let factor = 1.0 / Rc::strong_count(wallpaper_rc) as f32;
+                match &wallpaper_rc.borrow().memory {
                     Memory::WlShm { pool } => {
                         wl_shm_count += factor;
                         wl_shm_size += factor * pool.len() as f32;
@@ -1025,141 +1225,260 @@ fn load_wallpapers(
     let mut error_count = 0usize;
     flush_blocking(connection);
     let mut fds_need_flush = 0usize;
-    for wallpaper_file in wallpaper_files {
-        if log::log_enabled!(log::Level::Debug) {
-            if wallpaper_file.path == wallpaper_file.canon_path {
-                debug!("Wallpaper file {:?} for workspace {}",
-                    wallpaper_file.path, wallpaper_file.workspace);
-            } else {
-                debug!("Wallpaper file {:?} -> {:?} for workspace {}",
-                    wallpaper_file.path, wallpaper_file.canon_path,
-                    wallpaper_file.workspace);
-            }
-        }
-        if let Some(wallpaper) = find_equal_output_wallpaper(
-            &workspace_backgrounds,
-            &wallpaper_file,
-            gpu_uploader.as_ref(),
-        ) {
-            workspace_backgrounds.push(WorkspaceBackground {
-                workspace_name: wallpaper_file.workspace,
-                workspace_number: wallpaper_file.workspace_number,
-                wallpaper,
-            });
-            reused_count += 1;
-            continue
-        }
-        if let Some(wallpaper) = find_equal_wallpaper(
-            &state.background_layers,
-            width,
-            height,
-            transform,
-            &wallpaper_file,
-            gpu_uploader.as_ref(),
-        ) {
-            workspace_backgrounds.push(WorkspaceBackground {
-                workspace_name: wallpaper_file.workspace,
-                workspace_number: wallpaper_file.workspace_number,
-                wallpaper,
-            });
-            reused_count += 1;
-            continue
-        }
-        if let Some(uploader) = gpu_uploader.as_mut() {
-            if let Err(e) = load_wallpaper(
-                &wallpaper_file.path,
-                uploader.staging_buffer(),
-                width as u32,
-                height as u32,
-                width as usize * 4,
-                wl_shm::Format::Xrgb8888,
-                state.color_transform,
-                &mut resizer,
-            ) {
-                error!("Failed to load wallpaper: {e:#}");
-                error_count += 1;
-                continue
-            }
-            match uploader.upload() {
-                Ok(gpu_wallpaper) => {
-                    let fds_count = gpu_wallpaper.memory_planes_len;
-                    if fds_need_flush + fds_count > MAX_FDS_OUT {
-                        flush_blocking(connection);
-                        fds_need_flush = 0;
+    for wallpaper_entry in wallpaper_files {
+        match wallpaper_entry {
+            WallpaperEntry::Single(wallpaper_file) => {
+                if log::log_enabled!(log::Level::Debug) {
+                    if wallpaper_file.path == wallpaper_file.canon_path {
+                        debug!("Wallpaper file {:?} for workspace {}",
+                            wallpaper_file.path, wallpaper_file.workspace);
+                    } else {
+                        debug!("Wallpaper file {:?} -> {:?} for workspace {}",
+                            wallpaper_file.path, wallpaper_file.canon_path,
+                            wallpaper_file.workspace);
                     }
-                    fds_need_flush += fds_count;
-                    let wallpaper = wallpaper_dmabuf(
-                        &state.dmabuf_state,
-                        qh,
-                        gpu_wallpaper,
-                        width,
-                        height,
-                        wallpaper_file.canon_path,
-                        wallpaper_file.canon_modified,
-                    );
+                }
+                if let Some(wallpaper) = find_equal_output_wallpaper(
+                    &workspace_backgrounds,
+                    &wallpaper_file,
+                    gpu_uploader.as_ref(),
+                ) {
                     workspace_backgrounds.push(WorkspaceBackground {
                         workspace_name: wallpaper_file.workspace,
                         workspace_number: wallpaper_file.workspace_number,
                         wallpaper,
+                        slideshow: None,
                     });
-                    loaded_count += 1;
+                    reused_count += 1;
                     continue
-                },
-                Err(e) => {
-                    error!("Failed to upload wallpaper to GPU: {e:#}");
-                    gpu_uploader = None;
-                    // fall back to shm
                 }
-            }
+                if let Some(wallpaper) = find_equal_wallpaper(
+                    &state.background_layers,
+                    width,
+                    height,
+                    transform,
+                    &wallpaper_file,
+                    gpu_uploader.as_ref(),
+                ) {
+                    workspace_backgrounds.push(WorkspaceBackground {
+                        workspace_name: wallpaper_file.workspace,
+                        workspace_number: wallpaper_file.workspace_number,
+                        wallpaper,
+                        slideshow: None,
+                    });
+                    reused_count += 1;
+                    continue
+                }
+                if let Some(uploader) = gpu_uploader.as_mut() {
+                    if let Err(e) = load_wallpaper(
+                        &wallpaper_file.path,
+                        uploader.staging_buffer(),
+                        width as u32,
+                        height as u32,
+                        width as usize * 4,
+                        wl_shm::Format::Xrgb8888,
+                        state.color_transform,
+                        &mut resizer,
+                    ) {
+                        error!("Failed to load wallpaper: {e:#}");
+                        error_count += 1;
+                        continue
+                    }
+                    match uploader.upload() {
+                        Ok(gpu_wallpaper) => {
+                            let fds_count = gpu_wallpaper.memory_planes_len;
+                            if fds_need_flush + fds_count > MAX_FDS_OUT {
+                                flush_blocking(connection);
+                                fds_need_flush = 0;
+                            }
+                            fds_need_flush += fds_count;
+                            let wallpaper = wallpaper_dmabuf(
+                                &state.dmabuf_state,
+                                qh,
+                                gpu_wallpaper,
+                                width,
+                                height,
+                                wallpaper_file.canon_path,
+                                wallpaper_file.canon_modified,
+                            );
+                            workspace_backgrounds.push(WorkspaceBackground {
+                                workspace_name: wallpaper_file.workspace,
+                                workspace_number: wallpaper_file.workspace_number,
+                                wallpaper,
+                                slideshow: None,
+                            });
+                            loaded_count += 1;
+                            continue
+                        },
+                        Err(e) => {
+                            error!("Failed to upload wallpaper to GPU: {e:#}");
+                            gpu_uploader = None;
+                            // fall back to shm
+                        }
+                    }
+                }
+                if fds_need_flush + 1 > MAX_FDS_OUT {
+                    flush_blocking(connection);
+                    fds_need_flush = 0;
+                }
+                fds_need_flush += 1;
+                let mut shm_pool = match RawPool::new(shm_size, &state.shm) {
+                    Ok(shm_pool) => shm_pool,
+                    Err(e) => {
+                        error!("Failed to create shm pool: {e}");
+                        error_count += 1;
+                        continue
+                    }
+                };
+                if let Err(e) = load_wallpaper(
+                    &wallpaper_file.path,
+                    shm_pool.mmap(),
+                    width as u32,
+                    height as u32,
+                    shm_stride,
+                    shm_format,
+                    state.color_transform,
+                    &mut resizer,
+                ) {
+                    error!("Failed to load wallpaper: {e:#}");
+                    error_count += 1;
+                    continue
+                }
+                let wl_buffer = shm_pool.create_buffer(
+                    0,
+                    width,
+                    height,
+                    shm_stride.try_into().unwrap(),
+                    shm_format,
+                    (),
+                    qh,
+                );
+                workspace_backgrounds.push(WorkspaceBackground {
+                    workspace_name: wallpaper_file.workspace,
+                    workspace_number: wallpaper_file.workspace_number,
+                    wallpaper: Rc::new(RefCell::new(Wallpaper {
+                        wl_buffer: Some(wl_buffer),
+                        // active_count: 0,
+                        memory: Memory::WlShm { pool: shm_pool },
+                        canon_path: wallpaper_file.canon_path,
+                        canon_modified: wallpaper_file.canon_modified,
+                    })),
+                    slideshow: None,
+                });
+                loaded_count += 1;
+            },
+            WallpaperEntry::Slideshow { workspace, workspace_number, images } => {
+                debug!("Slideshow workspace {} with {} images (lazy-loading, only first image preloaded)",
+                    workspace, images.len());
+                let total = images.len();
+                let mut permutation: Vec<usize> = (0..total).collect();
+                permutation.shuffle(&mut rand::thread_rng());
+
+                // Collect image paths for lazy loading
+                let image_paths: Vec<PathBuf> = images.iter().map(|f| f.path.clone()).collect();
+
+                // Load only the first image
+                let first_file = &images[permutation[0]];
+                let first_wallpaper = if let Some(uploader) = gpu_uploader.as_mut() {
+                    if let Err(e) = load_wallpaper(
+                        &first_file.path,
+                        uploader.staging_buffer(),
+                        width as u32,
+                        height as u32,
+                        width as usize * 4,
+                        wl_shm::Format::Xrgb8888,
+                        state.color_transform,
+                        &mut resizer,
+                    ) {
+                        error!("Failed to load first slideshow image: {e:#}");
+                        error_count += 1;
+                        continue
+                    }
+                    match uploader.upload() {
+                        Ok(gpu_wallpaper) => {
+                            let fds_count = gpu_wallpaper.memory_planes_len;
+                            if fds_need_flush + fds_count > MAX_FDS_OUT {
+                                flush_blocking(connection);
+                                fds_need_flush = 0;
+                            }
+                            fds_need_flush += fds_count;
+                            loaded_count += 1;
+                            wallpaper_dmabuf(
+                                &state.dmabuf_state,
+                                qh,
+                                gpu_wallpaper,
+                                width,
+                                height,
+                                first_file.canon_path.clone(),
+                                first_file.canon_modified,
+                            )
+                        },
+                        Err(e) => {
+                            error!("Failed to upload first slideshow image to GPU: {e:#}");
+                            gpu_uploader = None;
+                            // Fall through to shm
+                            continue  // skip, will be loaded lazily on first advance
+                        }
+                    }
+                } else {
+                    if fds_need_flush + 1 > MAX_FDS_OUT {
+                        flush_blocking(connection);
+                        fds_need_flush = 0;
+                    }
+                    fds_need_flush += 1;
+                    let mut shm_pool = match RawPool::new(shm_size, &state.shm) {
+                        Ok(shm_pool) => shm_pool,
+                        Err(e) => {
+                            error!("Failed to create shm pool for first slideshow image: {e}");
+                            error_count += 1;
+                            continue
+                        }
+                    };
+                    if let Err(e) = load_wallpaper(
+                        &first_file.path,
+                        shm_pool.mmap(),
+                        width as u32,
+                        height as u32,
+                        shm_stride,
+                        shm_format,
+                        state.color_transform,
+                        &mut resizer,
+                    ) {
+                        error!("Failed to load first slideshow image: {e:#}");
+                        error_count += 1;
+                        continue
+                    }
+                    let wl_buffer = shm_pool.create_buffer(
+                        0,
+                        width,
+                        height,
+                        shm_stride.try_into().unwrap(),
+                        shm_format,
+                        (),
+                        qh,
+                    );
+                    loaded_count += 1;
+                    Rc::new(RefCell::new(Wallpaper {
+                        wl_buffer: Some(wl_buffer),
+                        memory: Memory::WlShm { pool: shm_pool },
+                        canon_path: first_file.canon_path.clone(),
+                        canon_modified: first_file.canon_modified,
+                    }))
+                };
+
+                workspace_backgrounds.push(WorkspaceBackground {
+                    workspace_name: workspace,
+                    workspace_number,
+                    wallpaper: first_wallpaper,
+                    slideshow: Some(SlideshowState {
+                        image_paths,
+                        permutation,
+                        current_index: 0,
+                        is_active: false,
+                    }),
+                });
+            },
         }
-        if fds_need_flush + 1 > MAX_FDS_OUT {
-            flush_blocking(connection);
-            fds_need_flush = 0;
-        }
-        fds_need_flush += 1;
-        let mut shm_pool = match RawPool::new(shm_size, &state.shm) {
-            Ok(shm_pool) => shm_pool,
-            Err(e) => {
-                error!("Failed to create shm pool: {e}");
-                error_count += 1;
-                continue
-            }
-        };
-        if let Err(e) = load_wallpaper(
-            &wallpaper_file.path,
-            shm_pool.mmap(),
-            width as u32,
-            height as u32,
-            shm_stride,
-            shm_format,
-            state.color_transform,
-            &mut resizer,
-        ) {
-            error!("Failed to load wallpaper: {e:#}");
-            error_count += 1;
-            continue
-        }
-        let wl_buffer = shm_pool.create_buffer(
-            0,
-            width,
-            height,
-            shm_stride.try_into().unwrap(),
-            shm_format,
-            (),
-            qh,
-        );
-        workspace_backgrounds.push(WorkspaceBackground {
-            workspace_name: wallpaper_file.workspace,
-            workspace_number: wallpaper_file.workspace_number,
-            wallpaper: Rc::new(RefCell::new(Wallpaper {
-                wl_buffer: Some(wl_buffer),
-                // active_count: 0,
-                memory: Memory::WlShm { pool: shm_pool },
-                canon_path: wallpaper_file.canon_path,
-                canon_modified: wallpaper_file.canon_modified,
-            })),
-        });
-        loaded_count += 1;
     }
     if fds_need_flush > 0 {
         flush_blocking(connection);
@@ -1264,8 +1583,8 @@ fn wallpaper_dmabuf(
     dmabuf_state: &DmabufState,
     qh: &QueueHandle<State>,
     gpu_wallpaper: GpuWallpaper,
-    width: i32,
-    height: i32,
+        width: i32,
+        height: i32,
     canon_path: PathBuf,
     canon_modified: u128,
 ) -> Rc<RefCell<Wallpaper>> {

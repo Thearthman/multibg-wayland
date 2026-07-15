@@ -186,9 +186,18 @@ pub struct WallpaperFile {
     pub canon_modified: u128,
 }
 
+pub enum WallpaperEntry {
+    Single(WallpaperFile),
+    Slideshow {
+        workspace: String,
+        workspace_number: i32,
+        images: Vec<WallpaperFile>,
+    },
+}
+
 pub fn output_wallpaper_files(
     output_dir: &Path,
-) -> anyhow::Result<Vec<WallpaperFile>> {
+) -> anyhow::Result<Vec<WallpaperEntry>> {
     let dir = read_dir(output_dir).context("Failed to read directory")?;
     let mut ret = Vec::new();
     for dir_entry_result in dir {
@@ -201,7 +210,28 @@ pub fn output_wallpaper_files(
         };
         let path = dir_entry.path();
         if path.is_dir() {
-            warn!("Skipping nested directory {path:?}");
+            // A directory means a slideshow for the workspace it's named after
+            let workspace = path.file_name().unwrap()
+                .to_string_lossy().into_owned();
+            let workspace_number: i32 = workspace.parse().unwrap_or_default();
+            match collect_slideshow_images(&path) {
+                Ok(images) => {
+                    if images.is_empty() {
+                        warn!("Slideshow directory {path:?} contains no images, skipping");
+                    } else {
+                        debug!("Found {} images in slideshow directory {path:?} for workspace {}",
+                            images.len(), workspace);
+                        ret.push(WallpaperEntry::Slideshow {
+                            workspace,
+                            workspace_number,
+                            images,
+                        });
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to read slideshow directory {path:?}: {e}");
+                },
+            }
             continue
         }
         let workspace = path.file_stem().unwrap()
@@ -224,7 +254,54 @@ pub fn output_wallpaper_files(
         let canon_modified = canon_metadata.modified().unwrap()
             .duration_since(UNIX_EPOCH).unwrap()
             .as_nanos();
-        ret.push(WallpaperFile {
+        ret.push(WallpaperEntry::Single(WallpaperFile {
+            path,
+            workspace,
+            workspace_number,
+            canon_path,
+            canon_modified,
+        }));
+    }
+    Ok(ret)
+}
+
+fn collect_slideshow_images(
+    dir: &Path,
+) -> anyhow::Result<Vec<WallpaperFile>> {
+    let dir_entries = read_dir(dir).context("Failed to read slideshow directory")?;
+    let mut images = Vec::new();
+    for dir_entry_result in dir_entries {
+        let dir_entry = match dir_entry_result {
+            Ok(dir_entry) => dir_entry,
+            Err(e) => {
+                error!("Failed to read slideshow directory entry: {e}");
+                break
+            }
+        };
+        let path = dir_entry.path();
+        if path.is_dir() {
+            continue  // skip subdirectories
+        }
+        let workspace = String::new();  // unused for slideshow images
+        let workspace_number: i32 = 0;  // unused for slideshow images
+        let canon_path = match path.canonicalize() {
+            Ok(canon_path) => canon_path,
+            Err(e) => {
+                error!("Failed to resolve absolute path for {path:?}: {e}");
+                continue
+            }
+        };
+        let canon_metadata = match canon_path.metadata() {
+            Ok(canon_metadata) => canon_metadata,
+            Err(e) => {
+                error!("Failed to get file metadata for {canon_path:?}: {e}");
+                continue
+            }
+        };
+        let canon_modified = canon_metadata.modified().unwrap()
+            .duration_since(UNIX_EPOCH).unwrap()
+            .as_nanos();
+        images.push(WallpaperFile {
             path,
             workspace,
             workspace_number,
@@ -232,7 +309,9 @@ pub fn output_wallpaper_files(
             canon_modified,
         });
     }
-    Ok(ret)
+    // Sort by filename for deterministic base ordering before shuffle
+    images.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(images)
 }
 
 pub fn load_wallpaper(

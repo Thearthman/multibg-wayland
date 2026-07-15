@@ -68,10 +68,14 @@ pub struct Cli {
     /// upload and serve wallpapers from GPU memory using Vulkan
     #[arg(long)]
     pub gpu: bool,
-    /// list output names and make-model-serials and exit
+   /// list output names and make-model-serials and exit
+   #[arg(long)]
+   pub list_outputs: bool,
+    /// Slideshow duration in seconds: cycle images in slideshow workspace
+    /// folders with this interval. Disabled by default.
     #[arg(long)]
-    pub list_outputs: bool,
-    /// directory with: wallpaper_dir/output/workspace_name.{jpg|png|...}
+    pub slideshow_duration: Option<u64>,
+   /// directory with: wallpaper_dir/output/workspace_name.{jpg|png|...}
     #[arg(default_value = ".")]
     pub wallpaper_dir: String,
 }

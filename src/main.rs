@@ -12,12 +12,13 @@ mod wayland;
 use std::{
     env,
     io,
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{channel, Receiver},
     },
+    time::Duration,
 };
 
 use clap::Parser;
@@ -25,6 +26,7 @@ use log::{debug, error, info, warn};
 use rustix::{
     event::{poll, PollFd, PollFlags},
     io::retry_on_intr,
+    time::{timerfd_create, timerfd_settime, TimerfdClockId, TimerfdFlags, TimerfdTimerFlags, Itimerspec, Timespec},
 };
 use smithay_client_toolkit::{
     compositor::CompositorState,
@@ -68,6 +70,7 @@ struct State {
     dmabuf_state: DmabufState,
     gpu: Option<Gpu>,
     show_serials: bool,
+    slideshow_duration: Option<Duration>,
 }
 
 impl State {
@@ -118,6 +121,8 @@ fn run() -> anyhow::Result<()> {
 
     let wallpaper_dir = Path::new(&cli.wallpaper_dir).canonicalize().unwrap();
     let color_transform = cli.levels()?.map(ColorTransform::from_levels);
+
+    let slideshow_duration = cli.slideshow_duration.map(Duration::from_secs);
 
     // ********************************
     //     Initialize wayland client
@@ -170,6 +175,17 @@ fn run() -> anyhow::Result<()> {
     let (tx, rx) = channel();
     let waker = Arc::new(Waker::new().unwrap());
 
+    // Create timerfd for slideshow if enabled
+    let timerfd = if slideshow_duration.is_some() {
+        let fd = timerfd_create(
+            TimerfdClockId::Monotonic,
+            TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK,
+        ).map_err(|e| error!("Failed to create timerfd: {e}")).ok();
+        fd
+    } else {
+        None
+    };
+
     let mut state = State {
         compositor_state,
         registry_state,
@@ -187,6 +203,7 @@ fn run() -> anyhow::Result<()> {
         dmabuf_state,
         gpu,
         show_serials,
+        slideshow_duration,
     };
 
     event_queue.roundtrip(&mut state).unwrap();
@@ -197,7 +214,7 @@ fn run() -> anyhow::Result<()> {
     //     Main event loop
     // ********************************
 
-    let mut poll = Poll::with_capacity(3);
+    let mut poll = Poll::with_capacity(4);
     let token_wayland = poll.add_readable(&conn);
     ConnectionTask::spawn_subscribe_event_loop(compositor, tx, waker.clone());
     let token_compositor = poll.add_readable(&waker);
@@ -205,6 +222,14 @@ fn run() -> anyhow::Result<()> {
         .map_err(|e| error!("Failed to set up signal handling: {e}"))
         .ok();
     let token_signal = signal_pipe.as_ref().map(|pipe| poll.add_readable(pipe));
+    let token_timer = timerfd.as_ref().map(|fd| poll.add_readable(fd));
+
+    // Start the initial slideshow timer if enabled
+    if let Some(duration) = state.slideshow_duration {
+        if let Some(ref timerfd) = timerfd {
+            reset_timerfd(timerfd, duration);
+        }
+    }
 
     loop {
         flush_blocking(&conn);
@@ -218,6 +243,11 @@ fn run() -> anyhow::Result<()> {
         if poll.ready(token_compositor) {
             waker.read();
             handle_sway_event(&mut state, &rx);
+        }
+        if let Some(token_timer) = token_timer {
+            if poll.ready(token_timer) {
+                handle_slideshow_tick(&mut state, &event_queue.handle(), &timerfd);
+            }
         }
         if let Some(token_signal) = token_signal {
             if poll.ready(token_signal) {
@@ -316,5 +346,66 @@ fn handle_sway_event(
             );
             continue
         };
+    }
+}
+
+fn handle_slideshow_tick(
+    state: &mut State,
+    qh: &smithay_client_toolkit::reexports::client::QueueHandle<State>,
+    timerfd: &Option<OwnedFd>,
+) {
+    // Read the timerfd to clear the event
+    if let Some(ref timerfd) = timerfd {
+        let mut buf = [0u8; 8];
+        let _ = rustix::io::read(timerfd, &mut buf);
+    }
+
+    // Extract needed values before borrowing background_layers mutably
+    let shm_format = state.shm_format();
+    let color_transform = state.color_transform;
+    let shm = &state.shm;
+    let mut resizer = fast_image_resize::Resizer::new();
+
+    let mut any_advanced = false;
+    for bg_layer in state.background_layers.iter_mut() {
+        let shm_stride = match shm_format {
+            wl_shm::Format::Xrgb8888 => bg_layer.width as usize * 4,
+            wl_shm::Format::Bgr888 => (bg_layer.width as usize * 3).next_multiple_of(12),
+            _ => continue,
+        };
+        let shm_size = shm_stride * bg_layer.height as usize;
+
+        if bg_layer.advance_slideshow(
+            shm,
+            qh,
+            shm_format,
+            shm_stride,
+            shm_size,
+            color_transform,
+            &mut resizer,
+        ) {
+            any_advanced = true;
+        }
+    }
+
+    // Reset the timer for the next tick
+    if let Some(duration) = state.slideshow_duration {
+        if let Some(ref timerfd) = timerfd {
+            if any_advanced {
+                reset_timerfd(timerfd, duration);
+            }
+        }
+    }
+}
+
+fn reset_timerfd(timerfd: &OwnedFd, duration: Duration) {
+    let secs = duration.as_secs() as i64;
+    let nsecs = duration.subsec_nanos() as i64;
+    let spec = Itimerspec {
+        it_interval: Timespec { tv_sec: secs, tv_nsec: nsecs },
+        it_value: Timespec { tv_sec: secs, tv_nsec: nsecs },
+    };
+    if let Err(e) = timerfd_settime(timerfd, TimerfdTimerFlags::empty(), &spec) {
+        error!("Failed to set slideshow timer: {e}");
     }
 }
